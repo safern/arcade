@@ -13,6 +13,7 @@ using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Runtime.Versioning;
+using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 
 namespace Microsoft.DotNet.SignTool
@@ -33,6 +34,11 @@ namespace Microsoft.DotNet.SignTool
         /// Path to where container files will be extracted.
         /// </summary>
         private readonly string _pathToContainerUnpackingDirectory;
+
+        /// <summary>
+        /// Path to where Signing Suggestion file -> certificate mapping will be stored.
+        /// </summary>
+        private readonly string _pathToSigningSuggestions;
 
         /// <summary>
         /// This enable the overriding of the default certificate for a given file+token+target_framework.
@@ -65,7 +71,14 @@ namespace Microsoft.DotNet.SignTool
         /// </summary>
         internal List<KeyValuePair<string, string>> _filesToCopy;
 
-        public Configuration(string tempDir, string[] explicitSignList, Dictionary<string, SignInfo> defaultSignInfoForPublicKeyToken, 
+        /// <summary>
+        /// Contains the list of files that were discovered but doesn't have explicit
+        /// signing information. If this is not empty by the end of the file search 
+        /// the signing process will be aborted.
+        /// </summary>
+        private List<KeyValuePair<string, string>> _filesMissingCertificate;
+
+        public Configuration(string tempDir, string[] explicitSignList, Dictionary<string, SignInfo> defaultSignInfoForPublicKeyToken,
             Dictionary<ExplicitCertificateKey, string> explicitCertificates, Dictionary<string, SignInfo> extensionSignInfo, TaskLoggingHelper log)
         {
             Debug.Assert(tempDir != null);
@@ -74,6 +87,7 @@ namespace Microsoft.DotNet.SignTool
             Debug.Assert(explicitCertificates != null);
 
             _pathToContainerUnpackingDirectory = Path.Combine(tempDir, "ContainerSigning");
+            _pathToSigningSuggestions = Path.Combine(tempDir, "SigningSuggestions.props");
             _log = log;
             _defaultSignInfoForPublicKeyToken = defaultSignInfoForPublicKeyToken;
             _explicitCertificates = explicitCertificates;
@@ -83,6 +97,7 @@ namespace Microsoft.DotNet.SignTool
             _zipDataMap = new Dictionary<ImmutableArray<byte>, ZipData>(ByteSequenceComparer.Instance);
             _filesByContentKey = new Dictionary<SignedFileContentKey, FileSignInfo>();
             _explicitSignList = explicitSignList;
+            _filesMissingCertificate = new List<KeyValuePair<string, string>>();
         }
 
         internal BatchSignInput GenerateListOfFiles()
@@ -92,12 +107,36 @@ namespace Microsoft.DotNet.SignTool
                 TrackFile(fullPath, ContentUtil.GetContentHash(fullPath), isNested: false);
             }
 
+            if (_filesMissingCertificate.Count > 0)
+            {
+                _log.LogError($"Discovered unsigned files that do not have assigned certificates. " +
+                    $"To fix this issue add missing entries to Signing.props. The list of files and " +
+                    $"suggested certificates are listed in {_pathToSigningSuggestions}");
+
+                using (StreamWriter outputFile = new StreamWriter(_pathToSigningSuggestions, true))
+                {
+                    outputFile.WriteLine("<!-- The file -> certificate mapping below was determined heuristically " +
+                        "and must be reviewed before they are put in production code. --> ");
+
+                    outputFile.WriteLine("<Project>");
+                    outputFile.WriteLine("  <ItemGroup>");
+
+                    foreach (var item in _filesMissingCertificate)
+                    {
+                        outputFile.WriteLine($"     <FileSignInfo Include='{item.Key}' CertificateName='{item.Value}' />");
+                    }
+
+                    outputFile.WriteLine("  </ItemGroup>");
+                    outputFile.WriteLine("</Project>");
+                }
+            }
+
             return new BatchSignInput(_filesToSign.ToImmutableArray(), _zipDataMap.ToImmutableDictionary(ByteSequenceComparer.Instance), _filesToCopy.ToImmutableArray());
         }
 
         private FileSignInfo TrackFile(string fullPath, ImmutableArray<byte> contentHash, bool isNested)
         {
-            var fileSignInfo = ExtractSignInfo(fullPath, contentHash);
+            var fileSignInfo = ExtractSignInfo(fullPath, contentHash, suggestedCertificate);
 
             var key = new SignedFileContentKey(contentHash, Path.GetFileName(fullPath));
 
@@ -131,13 +170,10 @@ namespace Microsoft.DotNet.SignTool
             return fileSignInfo;
         }
 
-        private FileSignInfo ExtractSignInfo(string fullPath, ImmutableArray<byte> hash)
+        private FileSignInfo ExtractSignInfo(string fullPath, ImmutableArray<byte> hash, string suggestedCertificate)
         {
             var targetFramework = string.Empty;
-
-            // Try to determine default certificate name by the extension of the file
-            var hasSignInfo = _fileExtensionSignInfo.TryGetValue(Path.GetExtension(fullPath), out var signInfo);
-
+            var publicKeyToken = string.Empty;
             var isAlreadySigned = false;
 
             if (FileSignInfo.IsPEFile(fullPath))
@@ -147,46 +183,44 @@ namespace Microsoft.DotNet.SignTool
                     isAlreadySigned = ContentUtil.IsAuthenticodeSigned(stream);
                 }
 
-                GetPEInfo(fullPath, out var isManaged, out var publicKeyToken, out targetFramework);
-
-                // Get the default sign info based on the PKT, if applicable:
-                if (isManaged && _defaultSignInfoForPublicKeyToken.TryGetValue(publicKeyToken, out var pktBasedSignInfo))
-                {
-                    signInfo = pktBasedSignInfo;
-                    hasSignInfo = true;
-                }
-
-                // Check if we have more specific sign info:
-                var fileName = Path.GetFileName(fullPath);
-                if (_explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName, publicKeyToken, targetFramework), out var overridingCertificate) ||
-                    _explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName, publicKeyToken), out overridingCertificate) ||
-                    _explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName), out overridingCertificate))
-                {
-                    // If has overriding info, is it for ignoring the file?
-                    if (overridingCertificate.Equals(SignToolConstants.IgnoreFileCertificateSentinel, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return new FileSignInfo(fullPath, hash, SignInfo.Ignore);
-                    }
-
-                    signInfo = signInfo.WithCertificateName(overridingCertificate);
-                    hasSignInfo = true;
-                }
+                GetPEInfo(fullPath, out var isManaged, out publicKeyToken, out targetFramework);
             }
 
-            if (hasSignInfo)
+            var certificateName = string.Empty;
+            var fileName = Path.GetFileName(fullPath);
+            if (_explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName, publicKeyToken, targetFramework), out certificateName) ||
+                _explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName, publicKeyToken), out certificateName) ||
+                _explicitCertificates.TryGetValue(new ExplicitCertificateKey(fileName), out certificateName))
             {
-                if (isAlreadySigned &&
-                    !signInfo.Certificate.Equals(SignToolConstants.Certificate_Microsoft3rdPartyAppComponentDual, StringComparison.OrdinalIgnoreCase) &&
-                    !signInfo.Certificate.Equals(SignToolConstants.Certificate_Microsoft3rdPartyAppComponentSha2, StringComparison.OrdinalIgnoreCase))
+                // Should we ignore this file?
+                if (certificateName.Equals(SignToolConstants.IgnoreFileCertificateSentinel, StringComparison.OrdinalIgnoreCase))
                 {
+                    return new FileSignInfo(fullPath, hash, SignInfo.Ignore);
+                }
+
+                if (isAlreadySigned &&
+                    !certificateName.Equals(SignToolConstants.Certificate_Microsoft3rdPartyAppComponentDual, StringComparison.OrdinalIgnoreCase) &&
+                    !certificateName.Equals(SignToolConstants.Certificate_Microsoft3rdPartyAppComponentSha2, StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.LogMessage(MessageImportance.Low, $"Asked to sign this file but it was already signed: {fullPath}");
                     return new FileSignInfo(fullPath, hash, SignInfo.AlreadySigned);
                 }
 
-                return new FileSignInfo(fullPath, hash, signInfo, (targetFramework != "") ? targetFramework : null);
+                return new FileSignInfo(fullPath, hash, new SignInfo(certificateName));
             }
-
-            _log.LogWarning($"Couldn't determine signing information for this file: {fullPath}");
-            return new FileSignInfo(fullPath, hash, SignInfo.Ignore);
+            else
+            {
+                if (isAlreadySigned)
+                {
+                    _log.LogMessage(MessageImportance.Low, $"Skipping already signed file {fullPath}");
+                    return new FileSignInfo(fullPath, hash, SignInfo.AlreadySigned);
+                }
+                else
+                {
+                    _filesMissingCertificate.Add(new KeyValuePair<string, string>(fileName, suggestedCertificate));
+                    return new FileSignInfo(fullPath, hash, SignInfo.Ignore);
+                }
+            }
         }
 
         private static void GetPEInfo(string fullPath, out bool isManaged, out string publicKeyToken, out string targetFramework)

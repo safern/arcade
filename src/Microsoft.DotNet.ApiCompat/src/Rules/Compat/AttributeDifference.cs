@@ -65,7 +65,14 @@ namespace Microsoft.Cci.Differs.Rules
             if (impl == null || contract == null)
                 return DifferenceType.Unknown;
 
-            return CheckAttributeDifferences(differences, impl, impl.Attributes, contract.Attributes);
+            var diff = CheckAttributeDifferences(differences, impl, impl.Attributes, contract.Attributes);
+
+            if (diff == DifferenceType.Removed)
+            {
+                differences.Add(new Difference("diagnostic", $"{Contract}: {contract.Locations.FirstOrDefault()?.Document?.Location} -- {Implementation}: {impl.Locations.FirstOrDefault()?.Document?.Location}"));
+            }
+
+            return diff;
         }
 
         public override DifferenceType Diff(IDifferences differences, ITypeDefinitionMember impl, ITypeDefinitionMember contract)
@@ -73,7 +80,15 @@ namespace Microsoft.Cci.Differs.Rules
             if (impl == null || contract == null)
                 return DifferenceType.Unknown;
 
-            return CheckAttributeDifferences(differences, impl, impl.Attributes, contract.Attributes);
+            var diff = CheckAttributeDifferences(differences, impl, impl.Attributes, contract.Attributes);
+
+            if (diff == DifferenceType.Removed)
+            {
+                differences.Add(new Difference("diagnostic", $"{Contract}: {contract.Locations.FirstOrDefault()?.Document?.Location} -- {Implementation}: {impl.Locations.FirstOrDefault()?.Document?.Location}"));
+            }
+
+            return diff;
+
         }
 
         private DifferenceType CheckAttributeDifferences(IDifferences differences, IReference target, IEnumerable<ICustomAttribute> implAttributes, IEnumerable<ICustomAttribute> contractAttributes)
